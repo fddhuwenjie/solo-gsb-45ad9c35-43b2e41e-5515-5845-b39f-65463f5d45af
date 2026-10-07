@@ -56,6 +56,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000   # 首次启动自动建表
 | `POST /publish` | 批量发布，请求体 `{"expected_revision":n,"changes":[...]}` |
 | `POST /merge` | 基于历史基线的并行变更合入，请求体 `{"base_revision":n,"changes":[...]}` |
 | `POST /relocate` | 页面搬迁，请求体 `{"expected_revision":n,"old_path":"/a.html","new_path":"/b.html"}` |
+| `POST /prune` | 不可达页面清理，请求体 `{"expected_revision":n}`；没有可删页面时不产生新修订 |
 | `GET /redirects` | 当前全部旧地址跳转 `{"redirects":{旧地址:真实路径}}` |
 | `POST /redirects` | 登记跳转，请求体 `{"path":"/old.html","target":"/real.html"}`；不推进修订号 |
 | `DELETE /redirects` | 撤销跳转，请求体 `{"path":"/old.html"}`；不推进修订号 |
@@ -403,6 +404,51 @@ curl -s -X POST http://localhost:8000/merge \
 #   {"source":"/mine.html","target":"/news.html","reason":"target page not found"}]}
 ```
 
+## 不可达页面清理（`POST /prune`）
+
+已发布文档可能留下**从首页看不到的页面**（历史改版、搬迁遗留等）。`POST /prune`
+携带 `expected_revision`，在**同一个 SQLite 写事务**内找出并删除这些页面：
+
+- **入口集合**：`/index.html` 与所有**现行旧址跳转的真实目标**——跳转目标及其
+  可达页面必须保留。
+- **遍历规则**：沿页面内真正的站内 `<a href>` 遍历；相对、绝对及目录路径沿用
+  发布时的解析规则（目录形式映射到该目录的 `index.html`），查询串与 `#片段`
+  不改变目标，外部链接不参与。
+- **删除范围**：从入口不可达的全部页面——包括互相引用形成闭环的孤立页面。
+- **结果**：成功返回 `{"revision":n,"pruned":true,"deleted":[...]}`，
+  `deleted` 为按路径排序的删除清单；删除后的页面集合仍须通过既有整包链接校验
+  与跳转守护，失败时整体回滚（`422`），页面、跳转与修订号均不变。
+- **没有可删页面时不产生新修订**：返回 `{"revision":n,"pruned":false,"deleted":[]}`。
+- **首次发布前**（revision 0）返回 `404`；过期 `expected_revision` 按既有冲突
+  规则返回 `409`，内容不变。
+- 历史修订快照仍可通过 `GET /pages?revision=N` 读取；发布、站点访问与离线
+  下载保持可用。
+
+```bash
+# 清理（成功，revision -> N+1）：deleted 按路径排序列出被删页面
+curl -s -X POST http://localhost:8000/prune \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":3}'
+# {"revision":4,"pruned":true,"deleted":["/loop/a.html","/loop/b.html","/orphan.html"]}
+
+# 再次清理：没有可删页面时不产生新修订
+curl -s -X POST http://localhost:8000/prune \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":4}'
+# {"revision":4,"pruned":false,"deleted":[]}
+
+# 过期修订号 -> 409（与 /publish 相同的冲突响应），页面、跳转与修订号均不变
+curl -s -X POST http://localhost:8000/prune \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":1}'
+
+# 首次发布前 -> 404
+curl -s -X POST http://localhost:8000/prune \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":0}'
+# {"detail":"no published revision to prune","revision":0}
+```
+
 ## 可执行的 HTTP 调用示例
 
 启动服务后直接运行（仓库内已带可执行脚本）：
@@ -466,15 +512,16 @@ app/
   publish.py     # 单写事务：试用整批改动 -> 跳转守护 + 校验 -> 提交；冲突/校验错误（/merge 复用其试用与入口页校验）
   merge.py       # 单写事务：基线-当前路径比对 -> 并行合入 -> 跳转守护 + 整包校验 -> 新修订
   relocate.py    # 单写事务：页面搬迁、站内 href 改写（沿用 linkcheck/htmlrewrite）、旧地址跳转联动、整包校验、新修订
+  prune.py       # 单写事务：从首页与现行跳转目标沿站内 href 遍历可达页面，删除不可达页面（含互链孤儿闭环），跳转守护 + 整包校验兜底；无可删页面时不推进修订号
   redirects.py   # 旧地址跳转：登记/撤销（不推进修订号）、发布/合入/搬迁共用的跳转守护
   site.py        # /site 输出改写：绝对站内 href 加 /site 前缀（仅作用于读取响应，不改存储正文）
   archive.py     # 离线 ZIP 归档：同一读事务快照取当前页面与旧址跳转、站内 href 落盘改写、旧址离线入口、安全唯一映射检查
-  main.py        # FastAPI 路由与请求模型（/publish、/merge、/relocate、/redirects、/site 站点读取与 /download 离线下载）
-tests/          # pytest 端到端 + 链接解析/搬迁改写/并行合入/旧地址跳转/站点输出改写/离线下载单测
+  main.py        # FastAPI 路由与请求模型（/publish、/merge、/relocate、/prune、/redirects、/site 站点读取与 /download 离线下载）
+tests/          # pytest 端到端 + 链接解析/搬迁改写/并行合入/旧地址跳转/站点输出改写/离线下载/不可达清理单测
 Dockerfile
 docker-compose.yml
 entrypoint.sh   # 启动时初始化数据库再拉起 uvicorn
-examples.sh     # 可执行的 HTTP 调用示例（含 /site 输出改写、旧地址跳转的访问、搬迁与冲突场景）
+examples.sh     # 可执行的 HTTP 调用示例（含 /site 输出改写、旧地址跳转的访问、搬迁与冲突、不可达页面清理场景）
 ```
 
 ## 测试

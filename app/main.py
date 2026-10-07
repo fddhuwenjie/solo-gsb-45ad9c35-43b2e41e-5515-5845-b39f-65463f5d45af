@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 from . import db
 from .archive import ArchiveError, build_archive, load_snapshot
 from .merge import MergeBaselineNotFound, MergeConflict, merge
+from .prune import PruneNotPublished, prune
 from .publish import INDEX, PublishConflict, PublishValidationError, publish
 from .redirects import RedirectValidationError, register_redirect, revoke_redirect
 from .relocate import relocate
@@ -87,6 +88,12 @@ class MergeRequest(BaseModel):
 
     base_revision: int = Field(ge=0, description="本端改动所基于的历史修订号（0 为空基线）")
     changes: list[Change] = Field(default_factory=list)
+
+
+class PruneRequest(BaseModel):
+    """不可达页面清理：删除从 /index.html 与现行旧址跳转目标不可达的全部页面。"""
+
+    expected_revision: int = Field(ge=0, description="客户端预期的当前修订号，实现乐观锁")
 
 
 class RedirectRegisterRequest(BaseModel):
@@ -256,6 +263,39 @@ def relocate_endpoint(req: RelocateRequest):
                 "expected": req.expected_revision,
                 "current": exc.current_revision,
             },
+        )
+    except PublishValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "validation failed", "errors": exc.errors},
+        )
+    finally:
+        conn.close()
+
+
+@app.post("/prune")
+def prune_endpoint(req: PruneRequest):
+    """删除从 /index.html 与现行旧址跳转目标不可达的全部页面。
+
+    遍历、校验与提交在同一个 SQLite 写事务内完成；没有可删页面时不产生新修订。
+    """
+    conn = db.connect()
+    try:
+        revision, deleted = prune(conn, expected_revision=req.expected_revision)
+        return {"revision": revision, "pruned": bool(deleted), "deleted": deleted}
+    except PublishConflict as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "revision conflict",
+                "expected": req.expected_revision,
+                "current": exc.current_revision,
+            },
+        )
+    except PruneNotPublished:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "no published revision to prune", "revision": 0},
         )
     except PublishValidationError as exc:
         return JSONResponse(

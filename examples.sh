@@ -21,6 +21,11 @@ post_relocate() {
     -H 'Content-Type: application/json' -d "$1"
 }
 
+post_prune() {
+  curl -sS -w '\n  -> HTTP %{http_code}\n' -X POST "$BASE/prune" \
+    -H 'Content-Type: application/json' -d "$1"
+}
+
 post_redirect() {
   curl -sS -w '\n  -> HTTP %{http_code}\n' -X POST "$BASE/redirects" \
     -H 'Content-Type: application/json' -d "$1"
@@ -178,6 +183,25 @@ curl -sS -o /tmp/docs-archive.zip -w '  -> HTTP %{http_code}, %{size_download} b
   "$BASE/download"
 python3 -c "import zipfile; print('\n'.join('  ' + n for n in zipfile.ZipFile('/tmp/docs-archive.zip').namelist()))"
 echo "  解压后打开 index.html 即可离线浏览：unzip -o /tmp/docs-archive.zip -d /tmp/docs-offline"
+curl -sS "$BASE/revision"; echo
+
+echo "== 29) 发布两个从首页不可达的孤儿页（互链闭环）（预期 200，revision=12）"
+post_publish '{"expected_revision":11,"changes":[
+  {"op":"upsert","path":"/orphan.html","content":"<a href=\"/orphan2.html\">互链</a>"},
+  {"op":"upsert","path":"/orphan2.html","content":"<a href=\"/orphan.html\">互链</a>"}
+]}'
+
+echo "== 30) 清理不可达页面：孤儿闭环与遗留的 /docs/index.html 被删除（预期 200，revision=13，deleted 按路径排序）；跳转目标及其可达页保留"
+post_prune '{"expected_revision":12}'
+curl -sS "$BASE/redirects"; echo
+site_status /orphan.html
+site_status /guide/index.html
+
+echo "== 31) 再次清理：没有可删页面时不产生新修订（预期 200，revision 仍为 13，deleted 为空）"
+post_prune '{"expected_revision":13}'
+
+echo "== 32) 过期修订号清理（预期 409，页面、跳转与修订号均不变）"
+post_prune '{"expected_revision":12}'
 curl -sS "$BASE/revision"; echo
 
 echo "== 当前修订号与最终页面集合"
