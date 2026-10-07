@@ -180,6 +180,34 @@ python3 -c "import zipfile; print('\n'.join('  ' + n for n in zipfile.ZipFile('/
 echo "  解压后打开 index.html 即可离线浏览：unzip -o /tmp/docs-archive.zip -d /tmp/docs-offline"
 curl -sS "$BASE/revision"; echo
 
+post_prune() {
+  curl -sS -w '\n  -> HTTP %{http_code}\n' -X POST "$BASE/prune" \
+    -H 'Content-Type: application/json' -d "$1"
+}
+
+echo "== 29) 制造不可达页面：新增互相引用的孤立页 /orphan/a.html <-> /orphan/b.html 与无入链的 /orphan/lone.html（预期 200，revision=12）"
+post_publish '{"expected_revision":11,"changes":[
+  {"op":"upsert","path":"/index.html","content":"<h1 id=\"top\">首页</h1> <a href=\"/manual/guide.html?lang=zh#intro\">指南</a> <a href=\"/docs/index.html\">文档</a>"},
+  {"op":"upsert","path":"/orphan/a.html","content":"<a href=\"/orphan/b.html\">b</a>"},
+  {"op":"upsert","path":"/orphan/b.html","content":"<a href=\"a.html\">a</a>"},
+  {"op":"upsert","path":"/orphan/lone.html","content":"<p>无人引用</p>"}
+]}'
+
+echo "== 30) 清理不可达页面（预期 200，revision=13）：互相引用的孤立簇与无入链页面一并删除；跳转目标 /guide/index.html 保留"
+post_prune '{"expected_revision":12}'
+curl -sS "$BASE/pages"; echo
+
+echo "== 31) 再次清理：没有可删页面，不产生新修订（deleted 为空，revision 仍为 13）"
+post_prune '{"expected_revision":13}'
+
+echo "== 32) 过期修订号清理（预期 409，页面、跳转与修订号均不变）"
+post_prune '{"expected_revision":12}'
+
+echo "== 33) 历史快照仍可读取（revision=12 中仍能看到已清理的孤立页）；旧址 308 与站点访问保持可用"
+curl -sS "$BASE/pages?revision=12"; echo
+site_status /manual/index.html
+site_status /guide/index.html
+
 echo "== 当前修订号与最终页面集合"
 curl -sS "$BASE/revision"; echo
 curl -sS "$BASE/pages"; echo

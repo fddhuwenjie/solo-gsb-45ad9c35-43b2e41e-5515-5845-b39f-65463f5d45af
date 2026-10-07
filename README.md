@@ -56,6 +56,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000   # 首次启动自动建表
 | `POST /publish` | 批量发布，请求体 `{"expected_revision":n,"changes":[...]}` |
 | `POST /merge` | 基于历史基线的并行变更合入，请求体 `{"base_revision":n,"changes":[...]}` |
 | `POST /relocate` | 页面搬迁，请求体 `{"expected_revision":n,"old_path":"/a.html","new_path":"/b.html"}` |
+| `POST /prune` | 清理不可达页面，请求体 `{"expected_revision":n}`；没有可删页面时不产生新修订 |
 | `GET /redirects` | 当前全部旧地址跳转 `{"redirects":{旧地址:真实路径}}` |
 | `POST /redirects` | 登记跳转，请求体 `{"path":"/old.html","target":"/real.html"}`；不推进修订号 |
 | `DELETE /redirects` | 撤销跳转，请求体 `{"path":"/old.html"}`；不推进修订号 |
@@ -403,6 +404,72 @@ curl -s -X POST http://localhost:8000/merge \
 #   {"source":"/mine.html","target":"/news.html","reason":"target page not found"}]}
 ```
 
+## 不可达页面清理（`POST /prune`）
+
+已发布文档可能留下从首页看不到的页面（改版、搬迁后失去引用的旧页）。
+`POST /prune` 携带**预期修订号**，在**同一个 SQLite 写事务**内做可达性
+遍历并删除不可达页面：
+
+- **遍历起点**：入口页 `/index.html` 与所有现行旧址跳转的真实目标——
+  **跳转目标及其可达页面必须保留**。
+- **遍历规则**：沿真正的站内 `<a href>` 逐个解析（属性值里形似 `href=`
+  的文本不是真正的 href，不参与遍历）；相对、绝对及目录路径沿用发布时的
+  解析规则，查询串与 `#片段` 不改变目标，外部链接不参与。
+- **删除范围**：从这些入口无法到达的全部页面——包括互相引用但整体
+  不可达的孤立页面簇。
+- **结果**：成功返回 `{"revision":n,"pruned":true,"deleted":[...]}`，
+  删除清单按路径排序；**没有可删页面时不产生新修订**
+  （`{"revision":n,"pruned":false,"deleted":[]}`）。
+- **兜底**：删除后的最终页面集合沿用整包站内链接校验与跳转守护；
+  过期 `expected_revision` 返回 `409`，校验失败返回 `422`——
+  **页面、跳转与修订号均不变**。
+- **首次发布前**（revision 0）返回 `422`（`no published revision to prune`）。
+- 清理只删除当前修订中的页面：**历史修订快照仍可读取**，发布、站点访问
+  与离线下载保持可用。
+
+```bash
+# 首次发布：首页可达 /docs/guide.html；/old/a.html 与 /old/b.html 互相引用
+# 但首页不可达（孤立页面簇）；/legacy/home.html 首页也不可达，
+# 但登记了旧址跳转，属于必须保留的入口
+curl -s -X POST http://localhost:8000/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":0,"changes":[
+        {"op":"upsert","path":"/index.html",
+         "content":"<a href=\"/docs/guide.html\">指南</a>"},
+        {"op":"upsert","path":"/docs/guide.html","content":"<p>guide</p>"},
+        {"op":"upsert","path":"/old/a.html",
+         "content":"<a href=\"/old/b.html\">b</a>"},
+        {"op":"upsert","path":"/old/b.html",
+         "content":"<a href=\"a.html\">a</a>"},
+        {"op":"upsert","path":"/legacy/home.html","content":"<p>旧首页</p>"}]}'
+# {"revision":1,"published":true}
+curl -s -X POST http://localhost:8000/redirects \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"/legacy/index.html","target":"/legacy/home.html"}'
+
+# 清理：互相引用的 /old/a.html 与 /old/b.html 不可达，一并删除；
+# 跳转目标 /legacy/home.html 保留
+curl -s -X POST http://localhost:8000/prune \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":1}'
+# {"revision":2,"pruned":true,"deleted":["/old/a.html","/old/b.html"]}
+
+# 再次清理：没有可删页面，不产生新修订
+curl -s -X POST http://localhost:8000/prune \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":2}'
+# {"revision":2,"pruned":false,"deleted":[]}
+
+# 过期修订号 -> 409，页面、跳转与修订号均不变
+curl -s -X POST http://localhost:8000/prune \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":1}'
+# {"detail":"revision conflict","expected":1,"current":2}
+
+# 历史快照仍可读取（被删页面保留在第 1 修订中）
+curl -s "http://localhost:8000/pages?revision=1"
+```
+
 ## 可执行的 HTTP 调用示例
 
 启动服务后直接运行（仓库内已带可执行脚本）：
@@ -466,11 +533,12 @@ app/
   publish.py     # 单写事务：试用整批改动 -> 跳转守护 + 校验 -> 提交；冲突/校验错误（/merge 复用其试用与入口页校验）
   merge.py       # 单写事务：基线-当前路径比对 -> 并行合入 -> 跳转守护 + 整包校验 -> 新修订
   relocate.py    # 单写事务：页面搬迁、站内 href 改写（沿用 linkcheck/htmlrewrite）、旧地址跳转联动、整包校验、新修订
+  prune.py       # 单写事务：从 /index.html 与现行跳转目标出发沿真正站内 href 遍历，删除不可达页面（含孤立页面簇），跳转守护 + 整包校验兜底；无可删页面不产生新修订
   redirects.py   # 旧地址跳转：登记/撤销（不推进修订号）、发布/合入/搬迁共用的跳转守护
   site.py        # /site 输出改写：绝对站内 href 加 /site 前缀（仅作用于读取响应，不改存储正文）
   archive.py     # 离线 ZIP 归档：同一读事务快照取当前页面与旧址跳转、站内 href 落盘改写、旧址离线入口、安全唯一映射检查
-  main.py        # FastAPI 路由与请求模型（/publish、/merge、/relocate、/redirects、/site 站点读取与 /download 离线下载）
-tests/          # pytest 端到端 + 链接解析/搬迁改写/并行合入/旧地址跳转/站点输出改写/离线下载单测
+  main.py        # FastAPI 路由与请求模型（/publish、/merge、/relocate、/prune、/redirects、/site 站点读取与 /download 离线下载）
+tests/          # pytest 端到端 + 链接解析/搬迁改写/并行合入/旧地址跳转/站点输出改写/离线下载/不可达清理单测
 Dockerfile
 docker-compose.yml
 entrypoint.sh   # 启动时初始化数据库再拉起 uvicorn

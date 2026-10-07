@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 from . import db
 from .archive import ArchiveError, build_archive, load_snapshot
 from .merge import MergeBaselineNotFound, MergeConflict, merge
+from .prune import prune
 from .publish import INDEX, PublishConflict, PublishValidationError, publish
 from .redirects import RedirectValidationError, register_redirect, revoke_redirect
 from .relocate import relocate
@@ -87,6 +88,12 @@ class MergeRequest(BaseModel):
 
     base_revision: int = Field(ge=0, description="本端改动所基于的历史修订号（0 为空基线）")
     changes: list[Change] = Field(default_factory=list)
+
+
+class PruneRequest(BaseModel):
+    """不可达页面清理：删除从 /index.html 与现行跳转目标无法到达的页面。"""
+
+    expected_revision: int = Field(ge=0, description="客户端预期的当前修订号，实现乐观锁")
 
 
 class RedirectRegisterRequest(BaseModel):
@@ -248,6 +255,39 @@ def relocate_endpoint(req: RelocateRequest):
             "old_path": req.old_path,
             "new_path": req.new_path,
         }
+    except PublishConflict as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "revision conflict",
+                "expected": req.expected_revision,
+                "current": exc.current_revision,
+            },
+        )
+    except PublishValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "validation failed", "errors": exc.errors},
+        )
+    finally:
+        conn.close()
+
+
+@app.post("/prune")
+def prune_endpoint(req: PruneRequest):
+    """清理从 /index.html 与现行跳转目标不可达的页面。
+
+    在同一个 SQLite 写事务内：从入口页与所有现行旧址跳转的真实目标出发，
+    沿真正的站内 ``<a href>`` 遍历（相对、绝对及目录路径沿用发布时的解析
+    规则，查询串与片段不改变目标，外链不参与），删除无法到达的全部页面
+    （含互相引用的孤立页面簇），再以跳转守护与整包链接校验兜底。
+    没有可删页面时不产生新修订；过期修订号返回 409，校验失败返回 422，
+    页面、跳转与修订号均不变。
+    """
+    conn = db.connect()
+    try:
+        revision, deleted = prune(conn, expected_revision=req.expected_revision)
+        return {"revision": revision, "pruned": bool(deleted), "deleted": deleted}
     except PublishConflict as exc:
         return JSONResponse(
             status_code=409,
